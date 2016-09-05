@@ -1,8 +1,11 @@
-from os import path, system, chdir
 from subprocess import check_call, call, PIPE, CalledProcessError
+from os import path, system, chdir
 import hitchpython
+import hitchserve
 import hitchtest
 import hitchcli
+from commandlib import Command, run
+from pathlib import Path
 
 
 # Get directory above this file
@@ -13,50 +16,73 @@ class ExecutionEngine(hitchtest.ExecutionEngine):
 
     def set_up(self):
         """Set up your applications and the test environment."""
-        chdir(PROJECT_DIRECTORY)
-        self.cli_steps = hitchcli.CommandLineStepLibrary()
-
-        self.run = self.cli_steps.run
-        self.expect = self.cli_steps.expect
-        self.send_control = self.cli_steps.send_control
-        self.send_line = self.cli_steps.send_line
-        self.finish = self.cli_steps.finish
-
         self.python_package = hitchpython.PythonPackage(
             self.preconditions.get('python_version', '3.5.0')
         )
         self.python_package.build()
 
         # Uninstall and reinstall
+        call([self.python_package.pip, "install", "ipython==1.2.1", ], stdout=PIPE)
+        call([self.python_package.pip, "install", "pyzmq", ], stdout=PIPE)
+        call([self.python_package.pip, "install", "flake8", ], stdout=PIPE)
         call([self.python_package.pip, "uninstall", "dumbyaml", "-y"], stdout=PIPE)
-        check_call([self.python_package.python, "setup.py", "install"], stdout=PIPE)
+        #chdir(PROJECT_DIRECTORY)
+        #check_call([self.python_package.python, "setup.py", "install"], stdout=PIPE)
+        
+        run(Command([self.python_package.python, "setup.py", "install"]).in_dir(PROJECT_DIRECTORY))
+        #print(Command([self.python_package.python, "setup.py", "install"]).arguments)
 
-        self.start_python_interpreter()
-        self.python_command("import dumbyaml")
-        self.python_command("import yaml")
 
+        self.services = hitchserve.ServiceBundle(
+            PROJECT_DIRECTORY,
+            startup_timeout=8.0,
+            shutdown_timeout=1.0
+        )
+        
+        self.services['IPython'] = hitchpython.IPythonKernelService(self.python_package)
+        
+        self.services.startup(interactive=False)
+        self.ipython_kernel_filename = self.services['IPython'].wait_and_get_ipykernel_filename()
+        self.ipython_step_library = hitchpython.IPythonStepLibrary()
+        self.ipython_step_library.startup_connection(self.ipython_kernel_filename)
+        
+        self.run_command = self.ipython_step_library.run
+        self.assert_true = self.ipython_step_library.assert_true
+        self.assert_exception = self.ipython_step_library.assert_exception
+        self.shutdown_connection = self.ipython_step_library.shutdown_connection
+        self.run_command("import dumbyaml")
+        self.run_command("import yaml")
 
-    def start_python_interpreter(self):
-        self.run(self.python_package.python)
-        self.expect(">>>")
-
-    def python_command(self, command=None, expect=None):
-        self.send_line(command)
-        if expect is not None:
-            self.expect(expect)
-        self.expect(">>>")
-
-    def assert_true(self, command):
-        self.python_command(command, expect="True")
-
-    def end_python_interpreter(self):
-        self.send_control("D")
-        self.finish()
+    def on_failure(self):
+        if self.settings.get("pause_on_failure", True):
+            if hasattr(self.settings, "services"):
+                import sys
+                self.services.log(message=self.stacktrace.to_template())
+                self.services.start_interactive_mode()
+                if path.exists(path.join(
+                    path.expanduser("~"), ".ipython/profile_default/security/",
+                    self.ipython_kernel_filename)
+                ):
+                    call([
+                            sys.executable, "-m", "IPython", "console",
+                            "--existing",
+                            path.join(
+                                path.expanduser("~"),
+                                ".ipython/profile_default/security/",
+                                self.ipython_kernel_filename
+                            )
+                        ])
+                else:
+                    call([
+                        sys.executable, "-m", "IPython", "console",
+                        "--existing", self.ipython_kernel_filename
+                    ])
+                self.services.stop_interactive_mode()
 
 
     def flake8(self, directory):
         # Silently install flake8
-        check_call([self.python_package.pip, "install", "flake8"], stdout=PIPE)
+        chdir(PROJECT_DIRECTORY)
         try:
             check_call([
                 path.join(self.python_package.bin_directory, "flake8"),
@@ -66,6 +92,7 @@ class ExecutionEngine(hitchtest.ExecutionEngine):
             raise RuntimeError("flake8 failure")
 
     def run_unit_tests(self, directory):
+        chdir(PROJECT_DIRECTORY)
         try:
             check_call([
                 path.join(self.python_package.bin_directory, "py.test"),
@@ -77,6 +104,8 @@ class ExecutionEngine(hitchtest.ExecutionEngine):
             raise RuntimeError("py.test failure")
 
     def tear_down(self):
+        if hasattr(self, 'services'):
+            self.services.shutdown()
         try:
             self.end_python_interpreter()
         except:
